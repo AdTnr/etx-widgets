@@ -63,6 +63,7 @@ local _options = {
     { "VoltSensor"            , SOURCE, 0 }, -- default to 'A1'
     { "PcntSensor"            , SOURCE, 0 },
     { "MahSensor"             , SOURCE, 0 },
+    { "Cel#"                  , SOURCE, 0 }, -- telemetry sensor for cell count
     { "Reserve"               , VALUE, 20, 0, 1000 },   -- reserve (or filter samples if calc percentage)
     { "Cells"                 , VALUE, 0, 0, 14 },      -- cell detection time (or interval if calc perceentage)
 }
@@ -121,7 +122,33 @@ local function update(wgt, options)
     wgt.periodic1 = wgt.tools.periodicInit()
     wgt.low_batt_blink = 0
 
-    if wgt.options.Cells == 0 then
+    -- Check telemetry sensor first, then manual setting, then auto detection
+    if wgt.useSensorC then
+        local sensorCells = getValue(wgt.options["Cel#"])
+        if sensorCells ~= nil and sensorCells > 0 then
+            -- use telemetry sensor cell count
+            wgt.cellCount = math.floor(sensorCells)
+            wgt.cell_detected = true
+        else
+            -- sensor not available or reading 0, fall back to manual/auto
+            if wgt.options.Cells == 0 then
+                local gvCel = model.getGlobalVariable(GV_CEL, 0)
+                if gvCel == 0 then
+                    -- auto cell detection
+                    wgt.cellCount = 1
+                    wgt.cell_detected = false
+                else
+                    -- use GV cell count
+                    wgt.cellCount = gvCel
+                    wgt.cell_detected = true
+                end
+            else
+                -- use cell settings
+                wgt.cellCount = wgt.options.Cells
+                wgt.cell_detected = true
+            end
+        end
+    elseif wgt.options.Cells == 0 then
         local gvCel = model.getGlobalVariable(GV_CEL, 0)
         if gvCel == 0 then
             -- auto cell detection
@@ -162,6 +189,7 @@ local function update(wgt, options)
 
     wgt.useSensorP = wgt.options.PcntSensor ~= 0
     wgt.useSensorM = wgt.options.MahSensor ~= 0
+    wgt.useSensorC = wgt.options["Cel#"] ~= 0
 
     if wgt.useSensorP then
         -- using telemetry for battery %
@@ -400,6 +428,20 @@ local function calculateBatteryData(wgt)
             log("no telemetry data")
         end
         return
+    end
+
+    -- Check telemetry sensor for cell count first (if enabled and available)
+    if wgt.useSensorC then
+        local sensorCells = getValue(wgt.options["Cel#"])
+        if sensorCells ~= nil and sensorCells > 0 then
+            local newCellCount = math.floor(sensorCells)
+            if newCellCount ~= wgt.cellCount then
+                wgt.cellCount = newCellCount
+                wgt.cell_detected = true
+                wgt.vMin = 99  -- reset min/max when cell count changes
+                wgt.vMax = 0
+            end
+        end
     end
 
     if (wgt.cell_detected == true) then
@@ -729,8 +771,19 @@ local function background(wgt)
         end
     end
 
-    -- check if GV:4(Cel) cell count changed
-    if wgt.options.Cells == 0 then
+    -- check if telemetry sensor cell count changed (highest priority)
+    if wgt.useSensorC then
+        local sensorCells = getValue(wgt.options["Cel#"])
+        if sensorCells ~= nil and sensorCells > 0 then
+            local newCellCount = math.floor(sensorCells)
+            if newCellCount ~= wgt.cellCount then
+                -- use new telemetry sensor cell count
+                wgt.cellCount = newCellCount
+                wgt.cell_detected = true
+            end
+        end
+    -- check if GV:4(Cel) cell count changed (fallback)
+    elseif wgt.options.Cells == 0 then
         local gvCel = model.getGlobalVariable(GV_CEL, 0)
         if gvCel ~= 0 and gvCel ~= wgt.cellCount then
             -- use new GV cell count
