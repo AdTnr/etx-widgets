@@ -43,13 +43,26 @@
 -- Author: Rob Gayle (bob00@rogers.com)
 -- Date: 2024
 -- ver: 0.7.5
+--
+-- CHANGES by AdTur:
+-- - Added Cel# telemetry sensor for automatic cell count detection
+-- - Added "battery inserted low" warning (high % + low voltage) with red blinking bar
+-- - Added configurable low voltage threshold setting (LowBatIns 40=4.0V)
+-- - Renamed options: "Reserve %", "LowBatIns 40=4.0V" for better clarity
+-- - Refactored all option names to use constants for cleaner code
+-- - Battery warning check now happens after vPercent calculation
+
+
 
 local app_name = "ePowerbar"
 
-local AUDIO_PATH = "/SOUNDS/en/"
+local AUDIO_PATH = "/WIDGETS/ePowerbar/audio/"
 
 local battCritical = 20
 local battLowMargin = 10
+local batteryInsertedLowPercent = 98  -- percentage threshold for battery inserted low warning
+local BATTERY_STABILIZATION_DELAY = 200  -- delay in 10ms units (1000ms) before checking battery inserted low
+local BATTERY_MIN_VOLTAGE = 3.0  -- minimum voltage threshold for battery connected low warning
 
 local cellFull = 4.16
 
@@ -59,13 +72,23 @@ local VFLT_INTERVAL_DEFAULT = 10
 
 local GV_CEL = 3
 
+-- Option name constants for cleaner code
+local OPT_RESERVE = "Reserve %"
+local OPT_LOW_BAT_INS = "LowBatIns 40=4.0V"
+local OPT_VOLT_SENSOR = "VoltSensor"
+local OPT_PCNT_SENSOR = "PcntSensor"
+local OPT_MAH_SENSOR = "MahSensor"
+local OPT_CELLS = "Cells"
+local OPT_CEL_SENSOR = "Cel#"
+
 local _options = {
-    { "VoltSensor"            , SOURCE, 0 }, -- default to 'A1'
-    { "PcntSensor"            , SOURCE, 0 },
-    { "MahSensor"             , SOURCE, 0 },
-    { "Cel#"                  , SOURCE, 0 }, -- telemetry sensor for cell count
-    { "Reserve"               , VALUE, 20, 0, 1000 },   -- reserve (or filter samples if calc percentage)
-    { "Cells"                 , VALUE, 0, 0, 14 },      -- cell detection time (or interval if calc perceentage)
+    { OPT_RESERVE             , VALUE, 20, 0, 1000 },   -- reserve (or filter samples if calc percentage)
+    { OPT_VOLT_SENSOR         , SOURCE, 0 }, -- default to 'A1'
+    { OPT_PCNT_SENSOR         , SOURCE, 0 },
+    { OPT_MAH_SENSOR          , SOURCE, 0 },
+    { OPT_CEL_SENSOR          , SOURCE, 0 }, -- telemetry sensor for cell count
+    { OPT_CELLS               , VALUE, 0, 0, 14 },      -- cell detection time (or interval if calc perceentage)
+    { OPT_LOW_BAT_INS         , VALUE, 40, 32, 45 },    -- low voltage threshold (3.2V = 32, 4.0V = 40, 4.5V = 45)
 }
 
 -- Data gathered from commercial lipo sensors
@@ -121,17 +144,20 @@ local function update(wgt, options)
     wgt.options = options
     wgt.periodic1 = wgt.tools.periodicInit()
     wgt.low_batt_blink = 0
+    wgt.bat_connected_low = 0
+    wgt.bat_connected_low_played = false
+    wgt.bat_connected_low_timer = 0
 
     -- Check telemetry sensor first, then manual setting, then auto detection
     if wgt.useSensorC then
-        local sensorCells = getValue(wgt.options["Cel#"])
+        local sensorCells = getValue(wgt.options[OPT_CEL_SENSOR])
         if sensorCells ~= nil and sensorCells > 0 then
             -- use telemetry sensor cell count
             wgt.cellCount = math.floor(sensorCells)
             wgt.cell_detected = true
         else
             -- sensor not available or reading 0, fall back to manual/auto
-            if wgt.options.Cells == 0 then
+            if wgt.options[OPT_CELLS] == 0 then
                 local gvCel = model.getGlobalVariable(GV_CEL, 0)
                 if gvCel == 0 then
                     -- auto cell detection
@@ -144,11 +170,11 @@ local function update(wgt, options)
                 end
             else
                 -- use cell settings
-                wgt.cellCount = wgt.options.Cells
+                wgt.cellCount = wgt.options[OPT_CELLS]
                 wgt.cell_detected = true
             end
         end
-    elseif wgt.options.Cells == 0 then
+    elseif wgt.options[OPT_CELLS] == 0 then
         local gvCel = model.getGlobalVariable(GV_CEL, 0)
         if gvCel == 0 then
             -- auto cell detection
@@ -161,18 +187,18 @@ local function update(wgt, options)
         end
     else
         -- use cell settings
-        wgt.cellCount = wgt.options.Cells
+        wgt.cellCount = wgt.options[OPT_CELLS]
         wgt.cell_detected = true
     end
 
     -- use default if user did not set, So widget is operational on "select widget"
-    if wgt.options.VoltSensor == 0 then
-        wgt.options.VoltSensor = defaultSensor
+    if wgt.options[OPT_VOLT_SENSOR] == 0 then
+        wgt.options[OPT_VOLT_SENSOR] = defaultSensor
     end
 
     wgt.options.source_name = ""
-    if (type(wgt.options.VoltSensor) == "number") then
-        local source_name = getSourceName(wgt.options.VoltSensor)
+    if (type(wgt.options[OPT_VOLT_SENSOR]) == "number") then
+        local source_name = getSourceName(wgt.options[OPT_VOLT_SENSOR])
         if (source_name ~= nil) then
             if string.byte(string.sub(source_name, 1, 1)) > 127 then
                 source_name = string.sub(source_name, 2, -1) -- ???? why?
@@ -184,17 +210,17 @@ local function update(wgt, options)
             wgt.options.source_name = source_name
         end
     else
-        wgt.options.source_name = wgt.options.VoltSensor
+        wgt.options.source_name = wgt.options[OPT_VOLT_SENSOR]
     end
 
-    wgt.useSensorP = wgt.options.PcntSensor ~= 0
-    wgt.useSensorM = wgt.options.MahSensor ~= 0
-    wgt.useSensorC = wgt.options["Cel#"] ~= 0
+    wgt.useSensorP = wgt.options[OPT_PCNT_SENSOR] ~= 0
+    wgt.useSensorM = wgt.options[OPT_MAH_SENSOR] ~= 0
+    wgt.useSensorC = wgt.options[OPT_CEL_SENSOR] ~= 0
 
     if wgt.useSensorP then
         -- using telemetry for battery %
-        if wgt.options.Reserve < 50 then
-            wgt.vReserve = wgt.options.Reserve
+        if wgt.options[OPT_RESERVE] < 50 then
+            wgt.vReserve = wgt.options[OPT_RESERVE]
             battCritical = wgt.vReserve > 0 and wgt.vReserve or 20
         else
             wgt.vReserve = 0
@@ -202,14 +228,14 @@ local function update(wgt, options)
         end
     else
         -- estimating battery %
-        if wgt.options.Cells ~= 0 then
-            wgt.vfltInterval = wgt.options.Cells
+        if wgt.options[OPT_CELLS] ~= 0 then
+            wgt.vfltInterval = wgt.options[OPT_CELLS]
         else
             wgt.vfltInterval = VFLT_INTERVAL_DEFAULT
         end
 
-        if wgt.options.Reserve ~= 0 then
-            wgt.vfltSamples = wgt.options.Reserve
+        if wgt.options[OPT_RESERVE] ~= 0 then
+            wgt.vfltSamples = wgt.options[OPT_RESERVE]
         else
             wgt.vfltSamples = VFLT_SAMPLES_DEFAULT
         end
@@ -252,6 +278,9 @@ local function create(zone, options)
         cellCount = 1,
         cell_detected = false,
         low_batt_blink = 0,
+        bat_connected_low = 0,
+        bat_connected_low_played = false,
+        bat_connected_low_timer = 0,
         vCellLive = 0,
         mainValue = 0,
         secondaryValue = 0,
@@ -328,6 +357,9 @@ local function onTelemetryResetEvent(wgt)
     wgt.cellCount = 1
     wgt.cell_detected = false
     wgt.low_batt_blink = 0
+    wgt.bat_connected_low = 0
+    wgt.bat_connected_low_played = false
+    wgt.bat_connected_low_timer = 0
     wgt.periodic1 = wgt.tools.periodicInit()
     --wgt.tools.periodicStart(wgt.periodic1, CELL_DETECTION_TIME * 1000)
 end
@@ -387,7 +419,7 @@ local function calcCellCount(wgt, singleVoltage)
     elseif singleVoltage < 34.4 then return 8
     elseif singleVoltage < 38.7 then return 9
     elseif singleVoltage < 43.0 then return 10
-    elseif singleVoltage < 47.3 then return 11
+    --elseif singleVoltage < 47.3 then return 11 -- 11s very rare and sometimes interfears with detection, so disabled for now
     elseif singleVoltage < 51.6 then return 12
     elseif singleVoltage < 60.2 then return 14
     end
@@ -400,9 +432,9 @@ end
 --- This function returns a table with cels values
 local function calculateBatteryData(wgt)
 
-    local v = getValue(wgt.options.VoltSensor)
-    local fieldinfo = getFieldInfo(wgt.options.VoltSensor)
-    log("wgt.options.VoltSensor: " .. wgt.options.VoltSensor)
+    local v = getValue(wgt.options[OPT_VOLT_SENSOR])
+    local fieldinfo = getFieldInfo(wgt.options[OPT_VOLT_SENSOR])
+    log("wgt.options[OPT_VOLT_SENSOR]: " .. wgt.options[OPT_VOLT_SENSOR])
 
     if type(v) == "table" then
         -- multi cell values using FLVSS liPo Voltage Sensor
@@ -432,7 +464,7 @@ local function calculateBatteryData(wgt)
 
     -- Check telemetry sensor for cell count first (if enabled and available)
     if wgt.useSensorC then
-        local sensorCells = getValue(wgt.options["Cel#"])
+        local sensorCells = getValue(wgt.options[OPT_CEL_SENSOR])
         if sensorCells ~= nil and sensorCells > 0 then
             local newCellCount = math.floor(sensorCells)
             if newCellCount ~= wgt.cellCount then
@@ -455,7 +487,7 @@ local function calculateBatteryData(wgt)
             if (v / newCellCount) >= cellFull then
                 wgt.low_batt_blink = 0
             else
-                playAudio("batlow")
+                playAudio("BatLow")
                 playNumber(v * 10, 1, PREC1)
             end
         else
@@ -482,7 +514,7 @@ local function calculateBatteryData(wgt)
     wgt.vCellLive = wgt.vTotalLive / wgt.cellCount
 
     if wgt.useSensorP then
-        local pcnt = getValue(wgt.options.PcntSensor)
+        local pcnt = getValue(wgt.options[OPT_PCNT_SENSOR])
         if pcnt < wgt.vReserve then
             wgt.vPercent = pcnt - wgt.vReserve
         else
@@ -493,8 +525,33 @@ local function calculateBatteryData(wgt)
         wgt.vPercent = updateFilteredvPercent(wgt, getCellPercent(wgt, wgt.vCellLive))
     end
 
+    -- Check for battery inserted low: high percentage but low cell voltage
+    local lowVoltThreshold = wgt.options[OPT_LOW_BAT_INS] / 10.0  -- convert from tenths to volts (40 = 4.0V)
+    local currentTime = getTime()
+    
+    -- Only check after telemetry has stabilized and cell count is established
+    -- Also ensure voltage is above minimum threshold (not disconnected/faulty battery)
+    if wgt.cell_detected and wgt.vPercent > batteryInsertedLowPercent and wgt.vCellLive < lowVoltThreshold and wgt.vCellLive >= BATTERY_MIN_VOLTAGE then
+        -- Start timer if not already started
+        if wgt.bat_connected_low_timer == 0 then
+            wgt.bat_connected_low_timer = currentTime
+        end
+        
+        -- Check if enough time has passed for stabilization
+        local elapsed = currentTime - wgt.bat_connected_low_timer
+        if elapsed >= BATTERY_STABILIZATION_DELAY then
+            wgt.bat_connected_low = 1
+        else
+            wgt.bat_connected_low = 0  -- Still stabilizing
+        end
+    else
+        -- Reset timer and warning state
+        wgt.bat_connected_low = 0
+        wgt.bat_connected_low_timer = 0
+    end
+
     if wgt.useSensorM then
-        wgt.vMah = getValue(wgt.options.MahSensor)
+        wgt.vMah = getValue(wgt.options[OPT_MAH_SENSOR])
     end
 
     -- log("wgt.vCellLive: ".. wgt.vCellLive)
@@ -550,11 +607,24 @@ local function getPercentColor(wgt)
     end
 end
 
+-- Get battery fill color for battery inserted low warning
+local function getBatteryFillColor(wgt)
+    local normalColor = getPercentColor(wgt)
+    
+    -- If battery inserted low warning is active, show red
+    if wgt.bat_connected_low == 1 then
+        return lcd.RGB(0xff, 0, 0)  -- red
+    else
+        return normalColor
+    end
+end
+
 local function drawBattery(wgt, myBatt)
     -- fill batt
-    local fill_color = getPercentColor(wgt)
+    local fill_color = getBatteryFillColor(wgt)
     local pcntY = math.floor(wgt.vPercent / 100 * (myBatt.h - myBatt.cath_h))
     local rectY = wgt.zone.y + myBatt.y + myBatt.h - pcntY
+    
     lcd.drawFilledRectangle(wgt.zone.x + myBatt.x, rectY, myBatt.w, pcntY, fill_color)
     lcd.drawLine(wgt.zone.x + myBatt.x, rectY, wgt.zone.x + myBatt.x + myBatt.w - 1, rectY, SOLID, wgt.cell_color)
 
@@ -575,7 +645,8 @@ local function refreshZoneTiny(wgt)
     lcd.drawRectangle(wgt.zone.x + 50, wgt.zone.y + 9, 16, 25, batt_color, 2)
     lcd.drawFilledRectangle(wgt.zone.x + 50 + 4, wgt.zone.y + 7, 6, 3, batt_color)
     local rect_h = math.floor(25 * wgt.vPercent / 100)
-    lcd.drawFilledRectangle(wgt.zone.x + 50, wgt.zone.y + 9 + 25 - rect_h, 16, rect_h, batt_color + wgt.no_telem_blink)
+    local fill_color = getBatteryFillColor(wgt)
+    lcd.drawFilledRectangle(wgt.zone.x + 50, wgt.zone.y + 9 + 25 - rect_h, 16, rect_h, fill_color + wgt.no_telem_blink)
 end
 
 --- Zone size: 160x32 1/8th
@@ -583,7 +654,7 @@ local function refreshZoneSmall(wgt)
     local myBatt = { ["x"] = 4, ["y"] = 4, ["w"] = wgt.zone.w - 8, ["h"] = wgt.zone.h - 8, ["segments_w"] = 25, ["color"] = WHITE, ["cath_w"] = 6, ["cath_h"] = 20 }
 
     -- fill battery
-    local fill_color = getPercentColor(wgt)
+    local fill_color = getBatteryFillColor(wgt)
     lcd.drawGauge(myBatt.x, myBatt.y, myBatt.w, myBatt.h, wgt.vPercent, 100, fill_color)
 
     -- draw battery
@@ -601,7 +672,9 @@ local function refreshZoneSmall(wgt)
     end
     lcd.drawText(myBatt.x + 8, myBatt.y + 4, volts, BOLD + LEFT  + wgt.text_color + wgt.no_telem_blink + wgt.low_batt_blink)
 
-    if wgt.useSensorM then
+    if wgt.bat_connected_low == 1 then
+        lcd.drawText(myBatt.x + 8, myBatt.y + myBatt.h / 2, "Bat Connected Low", BOLD + LEFT + wgt.text_color + wgt.no_telem_blink)
+    elseif wgt.useSensorM then
         local mah = string.format("%.0f mah", wgt.vMah)
         lcd.drawText(myBatt.x + 8, myBatt.y + myBatt.h / 2, mah, BOLD + LEFT  + wgt.text_color + wgt.no_telem_blink)
     end
@@ -629,7 +702,9 @@ local function refreshZoneMedium(wgt)
     end
     lcd.drawText(wgt.zone.x + wgt.zone.w - 5 - wgt.border_r, wgt.zone.y + wgt.zone.h - 38, volts, RIGHT + wgt.text_color + wgt.no_telem_blink)
 
-    if wgt.useSensorM then
+    if wgt.bat_connected_low == 1 then
+        lcd.drawText(wgt.zone.x + wgt.zone.w - 5 - wgt.border_r, wgt.zone.y + wgt.zone.h - 20, "Bat Connected Low", RIGHT + wgt.text_color + wgt.no_telem_blink)
+    elseif wgt.useSensorM then
         local mah = string.format("%.0f mah", wgt.vMah)
         lcd.drawText(wgt.zone.x + wgt.zone.w - 5 - wgt.border_r, wgt.zone.y + wgt.zone.h - 20, mah, RIGHT + wgt.text_color + wgt.no_telem_blink)
     end
@@ -654,7 +729,9 @@ local function refreshZoneLarge(wgt)
     end
     lcd.drawText(wgt.zone.x + wgt.zone.w, wgt.zone.y + wgt.zone.h - 38, volts, RIGHT + BOLD + wgt.text_color + wgt.no_telem_blink)
 
-    if wgt.useSensorM then
+    if wgt.bat_connected_low == 1 then
+        lcd.drawText(wgt.zone.x + wgt.zone.w, wgt.zone.y + wgt.zone.h - 20, "Bat Connected Low", RIGHT + BOLD + wgt.text_color + wgt.no_telem_blink)
+    elseif wgt.useSensorM then
         local mah = string.format("%.0f mah", wgt.vMah)
         lcd.drawText(wgt.zone.x + wgt.zone.w, wgt.zone.y + wgt.zone.h - 20, mah, RIGHT + BOLD + wgt.text_color + wgt.no_telem_blink)
     end
@@ -724,6 +801,15 @@ local function background(wgt)
 
     calculateBatteryData(wgt)
 
+    -- haptic feedback for battery connected low
+    if wgt.bat_connected_low == 1 and not wgt.bat_connected_low_played then
+        playHaptic(100, 0, PLAY_NOW)
+        playAudio("BatInL")
+        wgt.bat_connected_low_played = true
+    elseif wgt.bat_connected_low == 0 then
+        wgt.bat_connected_low_played = false
+    end
+
     -- voice alerts
     if wgt.isDataAvailable then
         local fvpcnt = wgt.vPercent
@@ -773,7 +859,7 @@ local function background(wgt)
 
     -- check if telemetry sensor cell count changed (highest priority)
     if wgt.useSensorC then
-        local sensorCells = getValue(wgt.options["Cel#"])
+        local sensorCells = getValue(wgt.options[OPT_CEL_SENSOR])
         if sensorCells ~= nil and sensorCells > 0 then
             local newCellCount = math.floor(sensorCells)
             if newCellCount ~= wgt.cellCount then
@@ -783,7 +869,7 @@ local function background(wgt)
             end
         end
     -- check if GV:4(Cel) cell count changed (fallback)
-    elseif wgt.options.Cells == 0 then
+    elseif wgt.options[OPT_CELLS] == 0 then
         local gvCel = model.getGlobalVariable(GV_CEL, 0)
         if gvCel ~= 0 and gvCel ~= wgt.cellCount then
             -- use new GV cell count
